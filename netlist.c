@@ -4,27 +4,29 @@
  *  5 nov 2001  udp/raw support by stran9er
  *  6 nov 2001  various relatively unimportant modifications by solar
  *  6 nov 2001  speed up by stran9er
+ *  5 jul 2005  v2.1: compatibility with linux kernel 2.6 and some speed-ups
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <unistd.h>
-#include <string.h>
-#include <ctype.h>
-#include <dirent.h>
-#include <pwd.h>
-#include <errno.h>
-#include <sys/types.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
+#include <sys/types.h>
 #include <arpa/inet.h>
-#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <pwd.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <search.h>
+#include <unistd.h>
 
-static int connsize = 0;
-static int commcols = 0;
-static int commlen = 7;
+static int connsize = 0;	/* number of sockets */
+static int commcols = 0;	/* determined columns for command name */
+static int commlen = 7;		/* determined maximum command length */
 
 static void fatal(const char *, ...)
   __attribute__ ((noreturn))
@@ -39,8 +41,9 @@ struct netinfo {
   int state;
   int uid;
   unsigned long inode;
-  int pid;
-  int fd;
+  int matched;	/* if found file descriptor */
+  int pid;	/* pid of found process */
+  int fd;	/* fd number */
   int type; /* tcp, udp, raw */
   char comm[16];
 };
@@ -58,11 +61,30 @@ static void fatal(const char *fmt, ...) {
   exit(1);
 }
 
+/* determine device code for sockets */
+dev_t determine_sockdev(void) {
+  int fd;
+  dev_t ret = 0;
+
+  if ((fd = socket(AF_INET, SOCK_STREAM, 0)) != -1) {
+    struct stat st;
+
+    if (fstat(fd, &st) != -1)
+      ret = st.st_dev;
+
+    close(fd);
+  }
+
+  return ret; 
+}
+
+/* qsort/bsearch helper */
 static int netinfo_cmp(const void *l, const void *r) {
   return (*(struct netinfo **)l)->inode - (*(struct netinfo **)r)->inode;
 }
 
-static struct netinfo *read_tcp_table(void) {
+/* read socket tables from /proc */
+static struct netinfo *read_net_tables(void) {
   char *fnames[] = {
     "/proc/net/raw",
     "/proc/net/udp",
@@ -129,9 +151,11 @@ static struct netinfo *read_tcp_table(void) {
   return ni;
 }
 
-static void scan_proc_table(void) {
+/* gather opened sockets from /proc/pid/fd/ */
+static void scan_proc_fd_dirs(void) {
   DIR *d_proc, *d_fd;
   struct dirent *proc_ent, *fd_ent;
+  dev_t sockdev = determine_sockdev();
 
   if (!(d_proc = opendir("/proc")))
     fatal("opendir: /proc: %s\n", strerror(errno));
@@ -159,8 +183,8 @@ static void scan_proc_table(void) {
 
       snprintf(file_path, PATH_MAX, "%s/%s", fd_path, fd_ent->d_name);
 
-      if ( stat(file_path, &st) == -1 ||
-	   st.st_dev )
+      if (stat(file_path, &st) == -1 ||
+	   st.st_dev != sockdev)
 	continue;
 
       key.inode = st.st_ino;
@@ -177,17 +201,19 @@ static void scan_proc_table(void) {
 	  mat->next = tmp;
 	  mat = tmp;
 	}
+	mat->matched++;
 	mat->pid = pid;
 	mat->fd = atoi(fd_ent->d_name);
       }
-    } /* while readdir */
+    } /* for each file descriptor */
 
     closedir(d_fd);
-  } /* while readdir */
+  } /* for each pid */
 
   closedir(d_proc);
 }
 
+/* gather process info */
 static void read_proc_stat(void) {
   struct netinfo *np;
   FILE *f;
@@ -211,34 +237,73 @@ static void read_proc_stat(void) {
     }
 }
 
+/* cache for getpwuid() */
+void *du_root = NULL;
+struct du_entry {
+  uid_t uid;	// *(struct du_entry *) is *(uid_t *)
+  char name[0];
+};
+
+int du_cmp(const void *pa, const void *pb) {
+  return *(uid_t *)pa - *(uid_t *)pb;
+}
+
+char *determine_user(uid_t uid) {
+  struct du_entry *du, **dup;
+  struct passwd *pw;
+  static char buf[32];
+  char *user = buf;
+
+  if ((dup = (struct du_entry **)tfind(&uid, &du_root, du_cmp))) {
+    return (*dup)->name;
+  }
+
+  if (!(pw = getpwuid(uid)))
+    snprintf(buf, sizeof(buf), "%d", uid);
+  else
+    user = pw->pw_name;
+
+  if ((du = malloc(sizeof(struct du_entry) + strlen(user) + 1))) {
+    du->uid = uid;
+    strcpy(du->name, user);
+    tsearch(du, &du_root, du_cmp);
+  }
+
+  return user;
+}
+
 static char *state[] = {
   "??", "ESTAB", "SYNSNT", "SYNRCV", "FINW1", "FINW2", "TIMEW", "CLOSE",
   "CLOSEW", "LASTACK", "LISTEN", "CLOSING"
 };
 
+/* output all together */
 static void output_netlist(void) {
   struct netinfo *np;
-  struct passwd *pw;
 
   for (np = ni; np; np = np->next)
     if (np->inode) {
-      char uid[32];
+      printf("%-8s ", determine_user(np->uid));
 
-      if (!(pw = getpwuid(np->uid)))
-        snprintf(uid, sizeof(uid), "%d", np->uid);
+      if (np->matched)
+	printf("%-5d %-*.*s%c%2d ", np->pid,
+	    commcols, commcols, np->comm, strlen(np->comm) > commcols ? '+' : ' ',
+	    np->fd);
+      else
+	printf("%-5s %-*.*s %2s ", "-", commcols, commcols, "-", "-");
 
-      printf("%-8s %-5d %-*.*s%c%2d ",
-	pw ? pw->pw_name : uid, np->pid, commcols, commcols, np->comm,
-	strlen(np->comm) > commcols ? '+' : ' ', np->fd);
       switch (np->type) {
 	case 2: printf("tcp "); break;
 	case 1: printf("udp "); break;
 	case 0: printf("raw ");
       }
+
       printf("%15s:%-5d ",
 	inet_ntoa(*(struct in_addr *)&np->locip), np->locport);
+
       printf("%15s:%-5d ",
 	inet_ntoa(*(struct in_addr *)&np->remip), np->remport);
+
       printf("%s\n",
 	(np->state > (sizeof(state) / sizeof(char *))) ?
 	"??" : state[np->state]);
@@ -248,7 +313,7 @@ static void output_netlist(void) {
 int main(void) {
   struct winsize ws;
   
-  if (!read_tcp_table())
+  if (!read_net_tables())
     fatal("No active Internet connections found\n");
 
   if (setgid(getgid())) /* drop egid for restricted /proc */
@@ -257,7 +322,7 @@ int main(void) {
   if (setuid(getuid()))
     fatal("setuid: %s\n", strerror(errno));
 
-  scan_proc_table();
+  scan_proc_fd_dirs();
 
   read_proc_stat();
 

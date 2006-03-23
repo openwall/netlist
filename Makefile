@@ -3,7 +3,7 @@ LD = gcc
 RM = rm -f
 MKDIR = mkdir -p
 INSTALL = install
-CFLAGS = -c -Wall -O2 -fomit-frame-pointer
+CFLAGS = -Wall -O2 -fomit-frame-pointer
 LDFLAGS = -s
 
 DESTDIR =
@@ -20,7 +20,7 @@ netlist: $(OBJS)
 	$(LD) $(LDFLAGS) $(OBJS) -o netlist
 
 .c.o:
-	$(CC) $(CFLAGS) $*.c
+	$(CC) $(CFLAGS) -c $*.c
 
 install: $(PROJ)
 	$(MKDIR) -m 755 $(DESTDIR)$(BINDIR) $(DESTDIR)$(MANDIR)/man1
